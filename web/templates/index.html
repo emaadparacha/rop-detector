@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ROP Detection Portal</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="page">
+    <header class="header">
+      <h1>Retinopathy of Prematurity Detector</h1>
+      <p class="subtitle">
+        Upload a fundus image. The model returns the probability of active ROP
+        and highlights the regions it considered most informative.
+      </p>
+    </header>
+
+    <main class="grid">
+      <section class="card">
+        <h2>1. Upload</h2>
+        <form id="predict-form" enctype="multipart/form-data">
+          <div id="drop-zone" class="drop-zone">
+            <p>Drag and drop an image here, or click to choose a file.</p>
+            <input id="image-input" type="file" name="image" accept="image/*" required />
+            <p id="file-name" class="file-name"></p>
+          </div>
+
+          <fieldset class="meta-fields">
+            <legend>Optional clinical metadata</legend>
+            <div class="meta-row">
+              <label>
+                Gestational age (weeks)
+                <input type="number" name="gestational_age_weeks" min="20" max="42" step="1" />
+              </label>
+              <label>
+                + extra days
+                <input type="number" name="gestational_age_days" min="0" max="6" step="1" />
+              </label>
+              <label>
+                Birth weight (g)
+                <input type="number" name="birth_weight_g" min="300" max="5000" step="10" />
+              </label>
+            </div>
+            <p class="hint">
+              Optional. If you leave these blank the model uses the image alone.
+            </p>
+          </fieldset>
+
+          <button type="submit" id="predict-btn">Analyze image</button>
+        </form>
+      </section>
+
+      <section class="card result-card" id="result-card" hidden>
+        <h2>2. Result</h2>
+        <div id="result-summary"></div>
+
+        <div class="image-row">
+          <figure>
+            <figcaption>Uploaded image</figcaption>
+            <img id="original-image" alt="Uploaded fundus image" />
+          </figure>
+          <figure>
+            <figcaption>Grad-CAM evidence overlay</figcaption>
+            <img id="heatmap-image" alt="Heatmap overlay" />
+          </figure>
+        </div>
+
+        <div class="reasons-grid">
+          <div>
+            <h3>Reasons supporting ROP</h3>
+            <ul id="reasons-for"></ul>
+          </div>
+          <div>
+            <h3>Reasons against ROP</h3>
+            <ul id="reasons-against"></ul>
+          </div>
+        </div>
+
+        <p class="disclaimer">
+          For research and educational use only. This tool is not a substitute
+          for evaluation by a qualified ophthalmologist.
+        </p>
+      </section>
+    </main>
+
+    <div id="error-banner" class="error-banner" hidden></div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
