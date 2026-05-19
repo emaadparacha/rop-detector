@@ -101,13 +101,37 @@ def download_dataset_zip(
 
     print(f"Downloading dataset from Google Drive (file id {file_id}) ...")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    url = f"https://drive.google.com/uc?id={file_id}"
-    out = gdown.download(url=url, output=str(destination), quiet=False, fuzzy=True)
+
+    # gdown's API has shifted across versions. Try the most explicit form
+    # first (id=) and fall back to URL with optional fuzzy matching for
+    # newer releases.
+    out = None
+    last_err: Exception | None = None
+    attempts: list[dict] = [
+        {"id": file_id, "output": str(destination), "quiet": False},
+        {"url": f"https://drive.google.com/uc?id={file_id}", "output": str(destination), "quiet": False},
+        {"url": f"https://drive.google.com/file/d/{file_id}/view", "output": str(destination), "quiet": False, "fuzzy": True},
+    ]
+    for kwargs in attempts:
+        try:
+            out = gdown.download(**kwargs)
+            if out:
+                break
+        except TypeError as exc:
+            # Older gdown does not accept some kwargs (e.g. fuzzy). Try next.
+            last_err = exc
+            continue
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+            continue
+
     if out is None or not Path(out).exists():
+        hint = f"  Last error from gdown: {last_err}\n" if last_err else ""
         raise SystemExit(
             "Download failed. The file may be private, the link may have changed, "
-            "or the network is blocking the request. You can download the zip "
-            "manually from\n"
+            "or the network is blocking the request.\n"
+            f"{hint}"
+            "You can download the zip manually from\n"
             f"    https://drive.google.com/file/d/{file_id}/view\n"
             f"and place it at {destination}, then re-run with --skip-download."
         )
@@ -133,13 +157,28 @@ def extract_dataset_zip(zip_path: Path) -> None:
     if extract_dir.exists():
         shutil.rmtree(extract_dir, ignore_errors=True)
     extract_dir.mkdir(parents=True, exist_ok=True)
+    # Selective extract: skip the __MACOSX resource-fork tree and any
+    # ._* AppleDouble sidecar entries. macOS adds these automatically when
+    # you compress a folder in Finder. Including them would (a) waste disk
+    # and (b) confuse our 'find the data folder' walk below, since
+    # __MACOSX/data sorts before data and would otherwise be picked first.
     with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(extract_dir)
+        for info in zf.infolist():
+            name = info.filename
+            parts = name.replace("\\", "/").split("/")
+            if any(p == "__MACOSX" for p in parts):
+                continue
+            if any(p.startswith("._") for p in parts):
+                continue
+            zf.extract(info, extract_dir)
 
-    # Find the 'data' folder and the metadata xlsx in the extracted tree.
+    # Find the 'data' folder and the metadata xlsx in the extracted tree,
+    # ignoring any stray __MACOSX folder defensively.
     found_data = None
     found_xlsx = None
     for root, dirs, files in os.walk(extract_dir):
+        # Prune __MACOSX so we never descend into it.
+        dirs[:] = [d for d in dirs if d != "__MACOSX"]
         root_path = Path(root)
         if found_data is None and root_path.name == "data":
             found_data = root_path
@@ -252,61 +291,130 @@ def load_metadata() -> pd.DataFrame:
     return merged
 
 
+def _normalize_token(text: str) -> str:
+    """Lowercase and replace separators so 'Stage 1', 'Stage-1', 'stage_1'
+    all collapse to 'stage1'. Used for fuzzy matching on file or folder names.
+    """
+    return re.sub(r"[\s_\-]+", "", text.lower())
+
+
 def label_from_name(name: str) -> tuple[str, str]:
     """Return (binary_label, original_class) for a filename.
 
     Binary label is 'rop' for any active ROP stage, 'not_rop' otherwise.
     Original class is one of: stage_1, stage_2, stage_3, laser_scars, normal.
+    Matching is case-insensitive and tolerates separators (space, underscore,
+    hyphen) so 'Stage 1 ROP 1.jpg' and 'stage_1_rop_1.jpg' both match.
     """
-    canon = canonical_name(name).lower()
-    if canon.startswith("stage_1"):
+    canon = canonical_name(name)
+    token = _normalize_token(canon)
+    if token.startswith("stage1"):
         return CLASS_ROP, "stage_1"
-    if canon.startswith("stage_2"):
+    if token.startswith("stage2"):
         return CLASS_ROP, "stage_2"
-    if canon.startswith("stage_3"):
+    if token.startswith("stage3"):
         return CLASS_ROP, "stage_3"
-    if canon.startswith("laser_scars"):
+    if token.startswith("laserscars") or token.startswith("laserscar"):
         return CLASS_NOT_ROP, "laser_scars"
-    if canon.startswith("normal"):
+    if token.startswith("normal"):
         return CLASS_NOT_ROP, "normal"
     raise ValueError(f"Could not assign a class to {name}")
 
 
+def label_from_folder(parts: tuple[str, ...]) -> tuple[str, str] | None:
+    """Fallback: figure out the class from the parent folder names.
+
+    Walks the path components from innermost outward looking for a
+    recognised folder keyword (Normal, laser scars, rop/stage_X).
+    Returns None if no match is found.
+    """
+    for part in reversed(parts):
+        token = _normalize_token(part)
+        if "laserscar" in token:
+            return CLASS_NOT_ROP, "laser_scars"
+        if "normal" in token:
+            return CLASS_NOT_ROP, "normal"
+        if "stage1" in token:
+            return CLASS_ROP, "stage_1"
+        if "stage2" in token:
+            return CLASS_ROP, "stage_2"
+        if "stage3" in token:
+            return CLASS_ROP, "stage_3"
+        if token in {"rop"} or "ropimage" in token:
+            return CLASS_ROP, "rop"
+    return None
+
+
+def _split_from_path(path: Path) -> str:
+    """Infer the dataset split (train/val/test) from a path's components.
+
+    Returns '' when no split keyword is found, so the caller can fall back
+    to a deterministic hash-based assignment.
+    """
+    for part in path.parts:
+        cleaned = part.strip().lower()
+        if cleaned in {"train", "training"}:
+            return "train"
+        if cleaned in {"val", "valid", "validate", "validation"}:
+            return "val"
+        if cleaned in {"test", "testing"}:
+            return "test"
+    return ""
+
+
 def collect_raw_images() -> list[dict]:
-    """Walk the raw data folders and return a list of records.
+    """Recursively walk RAW_DATA and collect a record for each image.
+
+    For each file we classify by filename prefix and infer the split from
+    the path (TRAIN / VALIDATE / TEST components, with or without trailing
+    spaces). This makes the script work regardless of the exact internal
+    folder layout of the data zip.
 
     Each record has: src_path, original_name, suggested_split, binary_label,
-    original_class. suggested_split is taken from the raw folder name for
-    ROP images. For non-ROP images we leave the split blank and assign it
-    later so that each split has both classes.
+    original_class.
     """
     records: list[dict] = []
 
-    def add(folder: Path, suggested_split: str) -> None:
-        if not folder.exists():
-            print(f"  Warning: missing folder {folder}", file=sys.stderr)
-            return
-        for f in sorted(folder.iterdir()):
-            if not f.is_file():
-                continue
-            if f.suffix.lower() not in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}:
-                continue
-            label, orig = label_from_name(f.name)
-            records.append(
-                {
-                    "src_path": str(f),
-                    "original_name": f.name,
-                    "suggested_split": suggested_split,
-                    "binary_label": label,
-                    "original_class": orig,
-                }
-            )
+    if not RAW_DATA.exists():
+        print(f"  ERROR: data folder does not exist: {RAW_DATA}", file=sys.stderr)
+        return records
 
-    add(RAW_ROP_TRAIN, "train")
-    add(RAW_ROP_VAL, "val")
-    add(RAW_ROP_TEST, "test")
-    add(RAW_NORMAL, "")
-    add(RAW_LASER, "")
+    image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+
+    for f in sorted(RAW_DATA.rglob("*")):
+        if not f.is_file():
+            continue
+        if f.suffix.lower() not in image_exts:
+            continue
+        # Skip macOS / OS junk files that ride along in zips:
+        #   ._Stage_1_ROP_1.jpg   AppleDouble metadata sidecar
+        #   .DS_Store             Finder metadata
+        #   Thumbs.db             Windows
+        if f.name.startswith("._") or f.name.startswith("."):
+            continue
+        # Skip files inside the macOS '__MACOSX' resource fork tree.
+        if any(part == "__MACOSX" for part in f.parts):
+            continue
+        try:
+            label, orig = label_from_name(f.name)
+        except ValueError:
+            # Fallback: try to figure out the class from the parent folder.
+            folder_match = label_from_folder(f.parts)
+            if folder_match is None:
+                print(f"  Warning: skipping unrecognised file: {f.relative_to(RAW_DATA)}", file=sys.stderr)
+                continue
+            label, orig = folder_match
+
+        records.append(
+            {
+                "src_path": str(f),
+                "original_name": f.name,
+                "suggested_split": _split_from_path(f.parent),
+                "binary_label": label,
+                "original_class": orig,
+            }
+        )
+
     return records
 
 
@@ -409,6 +517,61 @@ def main() -> None:
     print("Scanning raw image folders...")
     records = collect_raw_images()
     print(f"  Found {len(records)} raw images.")
+
+    if len(records) == 0:
+        print("\nERROR: no images were found inside the data folder.", file=sys.stderr)
+        print(f"Inspecting {RAW_DATA} ...", file=sys.stderr)
+        # Dump the first few directory entries to help diagnose layout.
+        try:
+            entries = sorted(RAW_DATA.iterdir())
+        except OSError as exc:
+            print(f"  Could not list {RAW_DATA}: {exc}", file=sys.stderr)
+            sys.exit(1)
+        if not entries:
+            print(f"  {RAW_DATA} is empty.", file=sys.stderr)
+        else:
+            print(f"  Top-level entries in data/ ({len(entries)} total):", file=sys.stderr)
+            for e in entries[:20]:
+                kind = "dir " if e.is_dir() else "file"
+                print(f"    {kind}  {e.name}", file=sys.stderr)
+            for sub in entries[:5]:
+                if sub.is_dir():
+                    try:
+                        sub_entries = sorted(sub.iterdir())[:10]
+                        print(f"  Inside {sub.name}/:", file=sys.stderr)
+                        for s in sub_entries:
+                            kind = "dir " if s.is_dir() else "file"
+                            print(f"    {kind}  {s.name}", file=sys.stderr)
+                    except OSError:
+                        pass
+        all_files = list(RAW_DATA.rglob("*"))
+        ext_counter: dict[str, int] = {}
+        real_jpgs: list[Path] = []
+        shadow_jpgs: list[Path] = []
+        for f in all_files:
+            if not f.is_file():
+                continue
+            ext_counter[f.suffix.lower()] = ext_counter.get(f.suffix.lower(), 0) + 1
+            if f.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}:
+                if f.name.startswith("._"):
+                    shadow_jpgs.append(f)
+                elif not f.name.startswith("."):
+                    real_jpgs.append(f)
+        if ext_counter:
+            print("  File extensions seen anywhere under data/:", file=sys.stderr)
+            for ext, n in sorted(ext_counter.items(), key=lambda kv: -kv[1]):
+                print(f"    {ext or '(no extension)':12s}  {n}", file=sys.stderr)
+        print(f"  Real image files (no leading dot): {len(real_jpgs)}", file=sys.stderr)
+        print(f"  AppleDouble shadow files (._*):    {len(shadow_jpgs)}", file=sys.stderr)
+        if real_jpgs:
+            print("  First few real image paths:", file=sys.stderr)
+            for f in real_jpgs[:8]:
+                print(f"    {f.relative_to(RAW_DATA)}", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Expected image filenames like Stage_1_ROP_1.jpg, Normal_1.jpg, laser_scars_1.jpg.", file=sys.stderr)
+        print("If your zip uses different filenames or extensions, share the output above and", file=sys.stderr)
+        print("I can adjust the recognizer.", file=sys.stderr)
+        sys.exit(1)
 
     print("Assigning splits...")
     assign_splits(records)
